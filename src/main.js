@@ -1,6 +1,14 @@
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls';
 
+// Add CombatState enum at the top of the file
+const CombatState = {
+    NONE: 'none',
+    ACTIVE: 'active',
+    VICTORY: 'victory',
+    GAME_OVER: 'game_over'
+};
+
 class Monster {
     constructor(x, y, z, type, scene) {
         this.type = type;
@@ -9,7 +17,10 @@ class Monster {
         this.position = new THREE.Vector3(x, y, z);
         this.blocks = [];
         this.scene = scene;
+        this.isRemoved = false;
+        this.isBeingRemoved = false;  // New flag to prevent concurrent removal
         this.createMonster();
+        console.log('Monster created:', { type, position: this.position });
     }
 
     createMonster() {
@@ -98,10 +109,57 @@ class Monster {
     }
 
     remove() {
-        if (this.monsterGroup) {
-            this.scene.remove(this.monsterGroup);
+        if (this.isRemoved || this.isBeingRemoved) {
+            console.log('Monster already removed or being removed');
+            return;
         }
-        this.blocks = [];
+        
+        try {
+            this.isBeingRemoved = true;
+            console.log('Starting monster removal process');
+            
+            if (this.monsterGroup) {
+                // Remove all meshes and materials
+                this.monsterGroup.traverse((object) => {
+                    if (object instanceof THREE.Mesh) {
+                        if (object.geometry) {
+                            object.geometry.dispose();
+                        }
+                        if (object.material) {
+                            if (Array.isArray(object.material)) {
+                                object.material.forEach(material => material.dispose());
+                            } else {
+                                object.material.dispose();
+                            }
+                        }
+                    }
+                });
+                
+                // Remove from scene
+                this.scene.remove(this.monsterGroup);
+                
+                // Clear all references
+                this.monsterGroup.clear();
+                this.monsterGroup = null;
+            }
+            
+            // Clear all references
+            this.blocks.forEach(block => {
+                if (block.geometry) block.geometry.dispose();
+                if (block.material) block.material.dispose();
+            });
+            this.blocks = [];
+            
+            // Clear position reference
+            this.position = null;
+            
+            this.isRemoved = true;
+            this.isBeingRemoved = false;
+            console.log('Monster successfully removed');
+        } catch (error) {
+            console.error('Error removing monster:', error);
+            this.isBeingRemoved = false;
+        }
     }
 }
 
@@ -225,6 +283,10 @@ class Game {
             // Add UI overlay container
             this.createUIOverlay();
 
+            // Add combat state
+            this.combatState = CombatState.NONE;
+            this.pendingMonsterRemoval = false;
+
             console.log('Game initialized successfully');
             console.log('Path points created:', this.pathPoints.length);
             console.log('Starting position:', startPoint);
@@ -237,10 +299,22 @@ class Game {
     }
 
     setupBackgroundMusic() {
+        // Create audio context
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const audioContext = new AudioContext();
+        
         // Create audio element with local file
-        const audio = new Audio('/audio/background-music.mp3');
+        const audioPath = import.meta.env.DEV ? '/minecraft-game/audio/background-music.mp3' : '/minecraft-game/audio/background-music.mp3';
+        const audio = new Audio(audioPath);
         audio.loop = true;
-        audio.volume = 0.2; // Initial volume at 20%
+        audio.volume = 0.4; // Initial volume at 40%
+        
+        // Connect audio to Web Audio API
+        const source = audioContext.createMediaElementSource(audio);
+        const gainNode = audioContext.createGain();
+        source.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+        gainNode.gain.value = 0.4; // Match initial volume
 
         // Create volume control container
         const volumeControl = document.createElement('div');
@@ -258,7 +332,7 @@ class Game {
 
         // Create play button
         const playButton = document.createElement('button');
-        playButton.textContent = '⏸️';  // Start with pause icon since music autoplays
+        playButton.textContent = '⏸️';
         playButton.style.backgroundColor = 'transparent';
         playButton.style.border = 'none';
         playButton.style.color = 'white';
@@ -281,11 +355,11 @@ class Game {
         slider.type = 'range';
         slider.min = '0';
         slider.max = '100';
-        slider.value = '20';
+        slider.value = '40';
         slider.style.width = '100px';
         slider.style.accentColor = '#ffffff';
 
-        let isPlaying = true;  // Start as true since we're autoplaying
+        let isPlaying = true;
 
         // Play button click handler
         playButton.onclick = () => {
@@ -294,7 +368,7 @@ class Game {
                 playButton.textContent = '▶️';
                 isPlaying = false;
             } else {
-                audio.play().catch(console.error);
+                audio.play();
                 playButton.textContent = '⏸️';
                 isPlaying = true;
             }
@@ -303,6 +377,7 @@ class Game {
         // Volume control
         slider.addEventListener('input', (e) => {
             const volume = e.target.value / 100;
+            gainNode.gain.value = volume;
             audio.volume = volume;
             muteButton.textContent = volume === 0 ? '🔇' : '🔊';
         });
@@ -310,12 +385,14 @@ class Game {
         // Mute button handler
         muteButton.addEventListener('click', () => {
             if (audio.volume > 0) {
+                gainNode.gain.value = 0;
                 audio.volume = 0;
                 slider.value = '0';
                 muteButton.textContent = '🔇';
             } else {
-                audio.volume = 0.2;
-                slider.value = '20';
+                gainNode.gain.value = 0.4;
+                audio.volume = 0.4;
+                slider.value = '40';
                 muteButton.textContent = '🔊';
             }
         });
@@ -326,22 +403,25 @@ class Game {
         volumeControl.appendChild(slider);
         document.body.appendChild(volumeControl);
 
-        // Try to autostart audio as soon as possible
-        const startAudio = () => {
-            audio.play().catch(console.error);
-        };
+        // Start audio immediately
+        audio.play().catch(error => {
+            console.log('Autoplay prevented:', error);
+            // If autoplay is prevented, we'll try again when the user interacts
+            const startAudio = () => {
+                audioContext.resume();
+                audio.play();
+                document.removeEventListener('click', startAudio);
+                document.removeEventListener('keydown', startAudio);
+                document.removeEventListener('touchstart', startAudio);
+            };
+            document.addEventListener('click', startAudio);
+            document.addEventListener('keydown', startAudio);
+            document.addEventListener('touchstart', startAudio);
+        });
 
-        // Try multiple ways to start audio
-        document.addEventListener('click', startAudio, { once: true });
-        document.addEventListener('touchstart', startAudio, { once: true });
-        document.addEventListener('keydown', startAudio, { once: true });
-        window.addEventListener('load', startAudio, { once: true });
-
-        // Store audio element for later use (like game over)
+        // Store audio element and context for later use
         this.backgroundMusic = audio;
-
-        // Also try to start immediately
-        startAudio();
+        this.audioContext = audioContext;
     }
 
     createInstructionsOverlay() {
@@ -717,9 +797,12 @@ class Game {
     }
 
     checkMonsterCollision() {
-        if (this.isInCombat) return;
+        if (this.combatState !== CombatState.NONE) return;
 
         const playerPosition = this.camera.position;
+        // Clean up any removed monsters first
+        this.monsters = this.monsters.filter(monster => !monster.isRemoved && !monster.isBeingRemoved);
+        
         for (let monster of this.monsters) {
             const distance = playerPosition.distanceTo(monster.position);
             if (distance < 4) {
@@ -730,9 +813,16 @@ class Game {
     }
 
     startCombat(monster) {
+        if (this.combatState !== CombatState.NONE) {
+            console.log('Combat already in progress');
+            return;
+        }
+        
+        console.log('Starting combat with monster:', monster);
+        this.combatState = CombatState.ACTIVE;
         this.isInCombat = true;
         this.currentMonster = monster;
-        this.showMathProblem(); // Show problem immediately
+        this.showMathProblem();
     }
 
     createParticle(position, color) {
@@ -912,7 +1002,12 @@ class Game {
     }
 
     showMathProblem() {
-        if (!this.currentMonster || !this.isInCombat) return;
+        // Safety check for monster state
+        if (!this.currentMonster || this.combatState !== CombatState.ACTIVE || this.currentMonster.isRemoved) {
+            console.log('Invalid state for showing math problem');
+            this.cleanupCombat();
+            return;
+        }
 
         // Reset all movement flags when showing math problem
         this.moveForward = false;
@@ -950,48 +1045,10 @@ class Game {
                     
                     if (userAnswer === problem.answer) {
                         this.currentMonster.correctAnswers++;
-                        console.log('Correct answers:', this.currentMonster.correctAnswers);
+                        console.log('Correct answer, total correct:', this.currentMonster.correctAnswers);
                         
                         if (this.currentMonster.correctAnswers >= 4) {
-                            console.log('Monster defeated!');
-                            this.mathOverlay.style.display = 'none';
-                            
-                            // Store monster info before removing
-                            const monsterPosition = this.currentMonster.position.clone();
-                            const monsterType = this.currentMonster.type;
-                            
-                            // Create defeat animation
-                            this.createDefeatAnimation(monsterPosition, monsterType);
-                            
-                            // Remove monster and update state
-                            this.currentMonster.remove();
-                            this.monsters = this.monsters.filter(m => m !== this.currentMonster);
-                            this.isInCombat = false;
-                            this.currentMonster = null;
-                            
-                            // Show victory message
-                            const victoryMsg = document.createElement('div');
-                            victoryMsg.textContent = 'Monster Defeated! Continue along the path!';
-                            victoryMsg.style.position = 'fixed';
-                            victoryMsg.style.top = '50%';
-                            victoryMsg.style.left = '50%';
-                            victoryMsg.style.transform = 'translate(-50%, -50%)';
-                            victoryMsg.style.backgroundColor = 'rgba(0, 255, 0, 0.8)';
-                            victoryMsg.style.color = 'white';
-                            victoryMsg.style.padding = '20px';
-                            victoryMsg.style.borderRadius = '10px';
-                            victoryMsg.style.fontSize = '24px';
-                            victoryMsg.style.textAlign = 'center';
-                            victoryMsg.style.zIndex = '1000';
-                            this.uiContainer.appendChild(victoryMsg);
-                            
-                            // Remove victory message after 2 seconds and re-enable controls
-                            setTimeout(() => {
-                                victoryMsg.remove();
-                                // Re-lock controls to enable movement
-                                this.controls.unlock();
-                                this.controls.lock();
-                            }, 2000);
+                            this.handleMonsterDefeat();
                         } else {
                             this.showMathProblem();
                         }
@@ -999,6 +1056,7 @@ class Game {
                         this.currentMonster.incorrectAnswers++;
                         if (this.currentMonster.incorrectAnswers >= 2) {
                             this.mathOverlay.style.display = 'none';
+                            this.combatState = CombatState.GAME_OVER;
                             this.createGameOverEffect();
                         } else {
                             this.showMathProblem();
@@ -1018,9 +1076,103 @@ class Game {
         this.answerInput.focus();
     }
 
+    cleanupCombat() {
+        if (this.pendingMonsterRemoval) {
+            console.log('Monster removal already pending');
+            return;
+        }
+        
+        console.log('Starting combat cleanup');
+        this.pendingMonsterRemoval = true;
+
+        // Hide math overlay
+        if (this.mathOverlay) {
+            this.mathOverlay.style.display = 'none';
+        }
+        
+        // Clean up current monster if it exists
+        if (this.currentMonster) {
+            const monsterToRemove = this.currentMonster;
+            
+            // Remove from monsters array first
+            this.monsters = this.monsters.filter(m => m !== monsterToRemove);
+            
+            // Then remove the monster itself
+            if (!monsterToRemove.isRemoved) {
+                monsterToRemove.remove();
+            }
+            
+            this.currentMonster = null;
+        }
+        
+        // Reset all states
+        this.isInCombat = false;
+        this.combatState = CombatState.NONE;
+        this.pendingMonsterRemoval = false;
+        
+        // Re-enable controls if needed
+        if (!document.pointerLockElement && this.controls) {
+            this.controls.lock();
+        }
+        
+        console.log('Combat cleanup completed');
+    }
+
+    handleMonsterDefeat() {
+        if (this.combatState !== CombatState.ACTIVE) {
+            console.log('Invalid state for monster defeat');
+            return;
+        }
+        
+        console.log('Processing monster defeat');
+        this.combatState = CombatState.VICTORY;
+        
+        // Hide math overlay immediately
+        this.mathOverlay.style.display = 'none';
+        
+        // Store monster info before removal
+        const monsterPosition = this.currentMonster.position.clone();
+        const monsterType = this.currentMonster.type;
+        
+        // Start cleanup process
+        this.cleanupCombat();
+        
+        // Create defeat animation
+        this.createDefeatAnimation(monsterPosition, monsterType);
+        
+        // Show victory message
+        const victoryMsg = document.createElement('div');
+        victoryMsg.textContent = 'Monster Defeated! Continue along the path!';
+        victoryMsg.style.position = 'fixed';
+        victoryMsg.style.top = '50%';
+        victoryMsg.style.left = '50%';
+        victoryMsg.style.transform = 'translate(-50%, -50%)';
+        victoryMsg.style.backgroundColor = 'rgba(0, 255, 0, 0.8)';
+        victoryMsg.style.color = 'white';
+        victoryMsg.style.padding = '20px';
+        victoryMsg.style.borderRadius = '10px';
+        victoryMsg.style.fontSize = '24px';
+        victoryMsg.style.textAlign = 'center';
+        victoryMsg.style.zIndex = '1000';
+        this.uiContainer.appendChild(victoryMsg);
+        
+        // Remove victory message after delay
+        setTimeout(() => {
+            victoryMsg.remove();
+            if (!document.pointerLockElement) {
+                this.controls.lock();
+            }
+            this.combatState = CombatState.NONE;
+        }, 2000);
+    }
+
     updateMonsters() {
-        // Update each monster's face orientation
+        if (this.pendingMonsterRemoval) return;
+        
         const playerPosition = this.camera.position;
+        // Clean up any removed monsters first
+        this.monsters = this.monsters.filter(monster => !monster.isRemoved && !monster.isBeingRemoved);
+        
         for (const monster of this.monsters) {
             monster.updateFaceOrientation(playerPosition);
         }

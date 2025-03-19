@@ -7,6 +7,12 @@ export default defineConfig({
     base: '/minecraft-game/',
     build: {
         outDir: 'dist',
-        assetsDir: 'assets'
+        assetsDir: 'assets',
+        sourcemap: true,
+        rollupOptions: {
+            output: {
+                manualChunks: undefined
+            }
+        }
     }
 }) 
